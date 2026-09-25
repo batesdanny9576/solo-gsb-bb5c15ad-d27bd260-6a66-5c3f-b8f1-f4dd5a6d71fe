@@ -68,6 +68,41 @@ class RunnerSummary(BaseModel):
     total: Optional[str] = Field(default=None, description="总用时，H:MM:SS")
 
 
+class BatchCheckinCreate(BaseModel):
+    """批量打卡请求：1~100 条，按顺序在同一事务内处理。"""
+
+    checkins: list[CheckinCreate] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="按顺序处理的打卡列表（1~100 条）；后续记录可用 corrects "
+        "更正本批前面刚写入且仍有效的事件",
+    )
+
+
+class BatchItemOut(BaseModel):
+    """批量打卡中单条记录的受理结果。"""
+
+    index: int = Field(..., description="在请求数组中的下标（从 0 开始）")
+    event_no: str = Field(..., description="该条打卡的事件号")
+
+
+class BatchRunnerResult(RunnerSummary):
+    """批量提交后某受影响选手的最终完成状态与总用时。"""
+
+    runner_id: str
+
+
+class BatchCheckinOut(BaseModel):
+    """批量打卡响应：仅在整批全部成功时返回。"""
+
+    results: list[BatchItemOut] = Field(..., description="各条打卡的事件号（按提交顺序）")
+    affected_runners: list[BatchRunnerResult] = Field(
+        ...,
+        description="受影响选手（含跨选手更正的原选手）按现有分段规则计算的最终完成状态与总用时",
+    )
+
+
 class SegmentChange(BaseModel):
     """同一分段在更正前后的对照。"""
 

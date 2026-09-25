@@ -8,6 +8,10 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 
 from .models import (
+    BatchCheckinCreate,
+    BatchCheckinOut,
+    BatchItemOut,
+    BatchRunnerResult,
     CheckinCreate,
     CheckinOut,
     CorrectionPreview,
@@ -143,6 +147,77 @@ def create_checkin(conn: sqlite3.Connection, payload: CheckinCreate) -> CheckinO
         corrects=payload.corrects,
         created_at=created,
     )
+
+
+def _batch_failure(status_code: int, index: int, event_no: str, reason: str) -> HTTPException:
+    """构造批量失败响应：携带失败下标与原因，状态码沿用单条登记的语义。"""
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "message": f"批量打卡在下标 {index} 处失败，整批已回滚",
+            "failures": [{"index": index, "event_no": event_no, "reason": reason}],
+        },
+    )
+
+
+def create_checkins_batch(
+    conn: sqlite3.Connection, payload: BatchCheckinCreate
+) -> BatchCheckinOut:
+    """批量登记打卡：1~100 条按顺序在同一事务内处理。
+
+    - 每条沿用单条登记的字段与校验（站点范围、事件号唯一、corrects 目标有效）；
+    - 后续记录可用 corrects 更正本批前面刚写入且仍有效的事件；
+    - 前向引用（含更正自身）、批内重复事件号、无效更正在对应下标处失败；
+    - 任一条失败时回滚整批的新增记录与状态变更，并返回失败下标与原因。
+    """
+    items = payload.checkins
+    # 批内事件号首次出现的下标，用于识别批内重复与前向引用
+    first_pos: dict[str, int] = {}
+    for i, item in enumerate(items):
+        first_pos.setdefault(item.event_no, i)
+
+    results: list[BatchItemOut] = []
+    runner_ids: list[str] = []
+
+    with conn:  # 单事务：任一失败时回滚整批写入与状态变更
+        for i, item in enumerate(items):
+            dup = first_pos[item.event_no]
+            if dup < i:
+                raise _batch_failure(
+                    409, i, item.event_no,
+                    f"事件号 {item.event_no} 与本批下标 {dup} 重复",
+                )
+            if item.corrects is not None:
+                target = first_pos.get(item.corrects)
+                if target is not None and target >= i:
+                    reason = (
+                        f"事件不能更正自身（corrects={item.corrects}）"
+                        if target == i
+                        else f"前向引用：被更正的事件 {item.corrects} "
+                        f"在本批下标 {target} 才登记"
+                    )
+                    raise _batch_failure(422, i, item.event_no, reason)
+            try:
+                origin = _validate_payload(conn, item)
+            except HTTPException as exc:
+                raise _batch_failure(
+                    exc.status_code, i, item.event_no, str(exc.detail)
+                ) from exc
+            _insert_correction(conn, item, _to_utc(item.occurred_at), _now())
+            results.append(BatchItemOut(index=i, event_no=item.event_no))
+            if item.runner_id not in runner_ids:
+                runner_ids.append(item.runner_id)
+            if origin is not None and origin["runner_id"] not in runner_ids:
+                runner_ids.append(origin["runner_id"])
+
+        # 全部写入后按现有分段规则重算受影响选手的最终结果
+        affected = [
+            BatchRunnerResult(
+                runner_id=rid, **_summary(_compute_splits(conn, rid)).model_dump()
+            )
+            for rid in runner_ids
+        ]
+    return BatchCheckinOut(results=results, affected_runners=affected)
 
 
 def revoke_checkin(conn: sqlite3.Connection, event_no: str) -> CheckinOut:

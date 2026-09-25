@@ -39,6 +39,22 @@ def preview(client, event_no, runner, station, occurred_at, corrects=None):
     return client.post("/api/checkins/preview-correction", json=body)
 
 
+def make_item(event_no, runner, station, occurred_at, corrects=None):
+    body = {
+        "event_no": event_no,
+        "runner_id": runner,
+        "station_seq": station,
+        "occurred_at": occurred_at,
+    }
+    if corrects is not None:
+        body["corrects"] = corrects
+    return body
+
+
+def batch(client, items):
+    return client.post("/api/checkins/batch", json={"checkins": items})
+
+
 def segment(splits, frm, to):
     return next(
         s for s in splits["segments"]
@@ -314,3 +330,190 @@ def test_preview_reuses_formal_validation(client):
     # 校验失败同样不落库
     assert client.get("/api/checkins/N-2").status_code == 404
     assert client.get("/api/checkins/N-4").status_code == 404
+
+
+# ---------- 批量打卡 ----------
+
+def test_batch_success_returns_event_nos_and_runner_results(client):
+    items = [
+        make_item("B-1", "TB1", 1, "2026-09-25T08:00:00"),
+        make_item("B-2", "TB1", 2, "2026-09-25T08:30:00"),
+        make_item("B-3", "TB1", 3, "2026-09-25T09:00:00"),
+        make_item("B-4", "TB1", 4, "2026-09-25T09:30:00"),
+        make_item("B-5", "TB1", 5, "2026-09-25T10:00:00"),
+        make_item("B-6", "TB1", 6, "2026-09-25T11:00:00"),
+    ]
+    r = batch(client, items)
+    assert r.status_code == 201
+    data = r.json()
+    # 各条事件号按提交顺序返回
+    assert [it["event_no"] for it in data["results"]] == [f"B-{k}" for k in range(1, 7)]
+    assert [it["index"] for it in data["results"]] == list(range(6))
+    # 受影响选手的最终完成状态与总用时
+    assert data["affected_runners"] == [
+        {"runner_id": "TB1", "complete": True, "total_seconds": 3 * 3600, "total": "3:00:00"}
+    ]
+    # 与分段查询结果一致
+    splits = client.get("/api/runners/TB1/splits").json()
+    assert splits["complete"] is True and splits["total_seconds"] == 3 * 3600
+
+
+def test_batch_in_batch_correction(client):
+    # 批内后续记录更正本批前面刚写入的事件
+    items = [
+        make_item("BC-1", "TB2", 1, "2026-09-25T08:00:00"),
+        make_item("BC-2X", "TB2", 2, "2026-09-25T12:00:00"),  # 错误时间
+        make_item("BC-3", "TB2", 3, "2026-09-25T09:00:00"),
+        make_item("BC-2", "TB2", 2, "2026-09-25T08:30:00", corrects="BC-2X"),
+    ]
+    r = batch(client, items)
+    assert r.status_code == 201
+    assert [it["event_no"] for it in r.json()["results"]] == ["BC-1", "BC-2X", "BC-3", "BC-2"]
+    # 原事件被取代，最终结果按更正后计算
+    assert client.get("/api/checkins/BC-2X").json()["status"] == "superseded"
+    assert client.get("/api/checkins/BC-2").json()["status"] == "active"
+    data = client.get("/api/runners/TB2/splits").json()
+    assert segment(data, 1, 2)["duration_seconds"] == 30 * 60
+    assert segment(data, 2, 3)["duration_seconds"] == 30 * 60
+
+
+def test_batch_corrects_existing_event(client):
+    post(client, "BE-1", "TB3", 1, "2026-09-25T08:00:00")
+    r = batch(client, [make_item("BE-2", "TB3", 1, "2026-09-25T08:05:00", corrects="BE-1")])
+    assert r.status_code == 201
+    assert client.get("/api/checkins/BE-1").json()["status"] == "superseded"
+
+
+def test_batch_cross_runner_correction_lists_both_runners(client):
+    # 批内更正跨选手：BR1 的第 2 站实际属于 BR2，受影响选手包含两人
+    items = [
+        make_item("BX-1", "BR1", 1, "2026-09-25T08:00:00"),
+        make_item("BX-2", "BR1", 2, "2026-09-25T08:40:00"),
+        make_item("BY-1", "BR2", 1, "2026-09-25T08:05:00"),
+        make_item("BY-2", "BR2", 2, "2026-09-25T08:40:00", corrects="BX-2"),
+    ]
+    r = batch(client, items)
+    assert r.status_code == 201
+    runners = {p["runner_id"]: p for p in r.json()["affected_runners"]}
+    assert set(runners) == {"BR1", "BR2"}
+    assert runners["BR1"]["complete"] is False
+    assert runners["BR1"]["total_seconds"] is None
+    assert runners["BR2"]["complete"] is False  # 仍缺后续站点
+    data = client.get("/api/runners/BR2/splits").json()
+    assert segment(data, 1, 2)["duration_seconds"] == 35 * 60
+
+
+def test_batch_forward_reference_rejected_and_rolled_back(client):
+    items = [
+        make_item("BF-1", "TB4", 1, "2026-09-25T08:00:00", corrects="BF-2"),  # 前向引用
+        make_item("BF-2", "TB4", 2, "2026-09-25T08:30:00"),
+    ]
+    r = batch(client, items)
+    assert r.status_code == 422
+    failure = r.json()["detail"]["failures"][0]
+    assert failure["index"] == 0
+    assert failure["event_no"] == "BF-1"
+    assert "前向引用" in failure["reason"]
+    # 整批回滚：两条记录均未写入
+    assert client.get("/api/checkins/BF-1").status_code == 404
+    assert client.get("/api/checkins/BF-2").status_code == 404
+
+
+def test_batch_self_correction_rejected(client):
+    r = batch(client, [make_item("BS-1", "TB5", 1, "2026-09-25T08:00:00", corrects="BS-1")])
+    assert r.status_code == 422
+    failure = r.json()["detail"]["failures"][0]
+    assert failure["index"] == 0
+    assert "自身" in failure["reason"]
+    assert client.get("/api/checkins/BS-1").status_code == 404
+
+
+def test_batch_duplicate_event_no_in_batch(client):
+    items = [
+        make_item("BD-1", "TB6", 1, "2026-09-25T08:00:00"),
+        make_item("BD-2", "TB6", 2, "2026-09-25T08:30:00"),
+        make_item("BD-1", "TB6", 3, "2026-09-25T09:00:00"),  # 与本批下标 0 重复
+    ]
+    r = batch(client, items)
+    assert r.status_code == 409
+    failure = r.json()["detail"]["failures"][0]
+    assert failure["index"] == 2
+    assert failure["event_no"] == "BD-1"
+    assert "重复" in failure["reason"]
+    # 整批回滚：前两条也不落库
+    assert client.get("/api/checkins/BD-1").status_code == 404
+    assert client.get("/api/checkins/BD-2").status_code == 404
+
+
+def test_batch_duplicate_with_existing_event(client):
+    post(client, "BK-1", "TB7", 1, "2026-09-25T08:00:00")
+    items = [
+        make_item("BK-2", "TB7", 2, "2026-09-25T08:30:00"),
+        make_item("BK-1", "TB7", 3, "2026-09-25T09:00:00"),  # 与库中已有事件重复
+    ]
+    r = batch(client, items)
+    assert r.status_code == 409
+    assert r.json()["detail"]["failures"][0]["index"] == 1
+    assert client.get("/api/checkins/BK-2").status_code == 404  # 已回滚
+    assert client.get("/api/checkins/BK-1").json()["status"] == "active"
+
+
+def test_batch_invalid_correction_target(client):
+    post(client, "BV-1", "TB8", 1, "2026-09-25T08:00:00")
+    client.post("/api/checkins/BV-1/revoke")
+    # 被更正事件不存在
+    r = batch(client, [make_item("BV-2", "TB8", 1, "2026-09-25T08:05:00", corrects="NOPE")])
+    assert r.status_code == 404
+    assert r.json()["detail"]["failures"][0]["index"] == 0
+    # 被更正事件已撤销
+    r = batch(client, [make_item("BV-3", "TB8", 1, "2026-09-25T08:05:00", corrects="BV-1")])
+    assert r.status_code == 409
+    assert r.json()["detail"]["failures"][0]["index"] == 0
+    assert client.get("/api/checkins/BV-2").status_code == 404
+    assert client.get("/api/checkins/BV-3").status_code == 404
+
+
+def test_batch_failure_rolls_back_status_changes(client):
+    # 第一条是合法更正（改变已有事件状态），第二条失败：状态变更也必须回滚
+    post(client, "BR-1", "TB9", 1, "2026-09-25T08:00:00")
+    items = [
+        make_item("BR-2", "TB9", 1, "2026-09-25T08:05:00", corrects="BR-1"),
+        make_item("BR-3", "TB9", 7, "2026-09-25T09:00:00"),  # 站点超范围
+    ]
+    r = batch(client, items)
+    assert r.status_code == 422
+    failure = r.json()["detail"]["failures"][0]
+    assert failure["index"] == 1
+    assert failure["event_no"] == "BR-3"
+    # 新增记录与状态变更全部回滚
+    assert client.get("/api/checkins/BR-2").status_code == 404
+    assert client.get("/api/checkins/BR-1").json()["status"] == "active"
+
+
+def test_batch_size_limits(client):
+    assert batch(client, []).status_code == 422
+    items = [
+        make_item(f"BL-{k}", "TB10", 1, "2026-09-25T08:00:00") for k in range(101)
+    ]
+    assert batch(client, items).status_code == 422
+    # 恰好 100 条可以受理
+    items = [
+        make_item(f"BL-{k}", "TB10", 1, f"2026-09-25T08:{k // 60:02d}:{k % 60:02d}")
+        for k in range(100)
+    ]
+    r = batch(client, items)
+    assert r.status_code == 201
+    assert len(r.json()["results"]) == 100
+
+
+def test_batch_incomplete_runner_result(client):
+    # 缺站时受影响选手 complete=false，总用时为空
+    items = [
+        make_item("BI-1", "TB11", 1, "2026-09-25T08:00:00"),
+        make_item("BI-2", "TB11", 2, "2026-09-25T08:30:00"),
+    ]
+    r = batch(client, items)
+    assert r.status_code == 201
+    assert r.json()["affected_runners"] == [
+        {"runner_id": "TB11", "complete": False, "total_seconds": None, "total": None}
+    ]

@@ -8,7 +8,15 @@ from typing import Iterator, Optional
 from fastapi import Depends, FastAPI
 
 from . import db, seed, service
-from .models import CheckinCreate, CheckinOut, CorrectionPreview, PreviewCorrectionOut, SplitsOut
+from .models import (
+    BatchCheckinCreate,
+    BatchCheckinOut,
+    CheckinCreate,
+    CheckinOut,
+    CorrectionPreview,
+    PreviewCorrectionOut,
+    SplitsOut,
+)
 
 
 @asynccontextmanager
@@ -25,9 +33,10 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="越野赛分段计时 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "接收带唯一事件号的打卡，支持按事件号更正 / 撤销，并可预演更正（整体回滚）；"
+        "接收带唯一事件号的打卡，支持按事件号更正 / 撤销、批量登记（同一事务，"
+        "任一失败整体回滚），并可预演更正（整体回滚）；"
         "按站点顺序重算相邻站分段用时，缺站或时间倒退的分段标记为待定。"
     ),
     lifespan=lifespan,
@@ -66,6 +75,18 @@ def post_checkin(
     payload: CheckinCreate, conn: sqlite3.Connection = Depends(get_db)
 ) -> CheckinOut:
     return service.create_checkin(conn, payload)
+
+
+@app.post(
+    "/api/checkins/batch",
+    response_model=BatchCheckinOut,
+    status_code=201,
+    summary="批量登记打卡（1~100 条，同一事务，任一失败整体回滚）",
+)
+def post_checkins_batch(
+    payload: BatchCheckinCreate, conn: sqlite3.Connection = Depends(get_db)
+) -> BatchCheckinOut:
+    return service.create_checkins_batch(conn, payload)
 
 
 @app.post(
