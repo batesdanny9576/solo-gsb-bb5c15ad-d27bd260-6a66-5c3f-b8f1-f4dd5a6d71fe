@@ -39,6 +39,22 @@ def preview(client, event_no, runner, station, occurred_at, corrects=None):
     return client.post("/api/checkins/preview-correction", json=body)
 
 
+def batch_item(event_no, runner, station, occurred_at, corrects=None):
+    body = {
+        "event_no": event_no,
+        "runner_id": runner,
+        "station_seq": station,
+        "occurred_at": occurred_at,
+    }
+    if corrects is not None:
+        body["corrects"] = corrects
+    return body
+
+
+def post_batch(client, items):
+    return client.post("/api/checkins/batch", json={"checkins": items})
+
+
 def segment(splits, frm, to):
     return next(
         s for s in splits["segments"]
@@ -314,3 +330,136 @@ def test_preview_reuses_formal_validation(client):
     # 校验失败同样不落库
     assert client.get("/api/checkins/N-2").status_code == 404
     assert client.get("/api/checkins/N-4").status_code == 404
+
+
+# ---------- 批量登记 ----------
+
+def test_batch_success_returns_event_nos_and_final_results(client):
+    r = post_batch(client, [
+        batch_item("B-1", "TB1", 1, "2026-09-25T08:00:00"),
+        batch_item("B-2", "TB1", 2, "2026-09-25T08:30:00"),
+        batch_item("B-3", "TB1", 3, "2026-09-25T09:00:00"),
+        batch_item("B-4", "TB1", 4, "2026-09-25T09:40:00"),
+        batch_item("B-5", "TB1", 5, "2026-09-25T10:20:00"),
+        batch_item("B-6", "TB1", 6, "2026-09-25T11:00:00"),
+    ])
+    assert r.status_code == 201
+    data = r.json()
+    assert data["count"] == 6
+    assert data["event_nos"] == ["B-1", "B-2", "B-3", "B-4", "B-5", "B-6"]
+    assert [x["runner_id"] for x in data["runners"]] == ["TB1"]
+    runner = data["runners"][0]
+    assert runner["complete"] is True
+    assert runner["total_seconds"] == 3 * 3600
+    assert runner["total"] == "3:00:00"
+    # 与现有分段查询结果一致
+    splits = client.get("/api/runners/TB1/splits").json()
+    assert splits["complete"] is True
+    assert splits["total_seconds"] == 3 * 3600
+
+
+def test_batch_intra_batch_correction(client):
+    # 批内后续记录更正本批前面刚写入的事件
+    r = post_batch(client, [
+        batch_item("BC-1", "TB2", 1, "2026-09-25T08:00:00"),
+        batch_item("BC-2X", "TB2", 2, "2026-09-25T12:00:00"),  # 错误时间
+        batch_item("BC-2", "TB2", 2, "2026-09-25T08:30:00", corrects="BC-2X"),
+        batch_item("BC-3", "TB2", 3, "2026-09-25T09:00:00"),
+    ])
+    assert r.status_code == 201
+    assert client.get("/api/checkins/BC-2X").json()["status"] == "superseded"
+    assert client.get("/api/checkins/BC-2").json()["status"] == "active"
+    data = client.get("/api/runners/TB2/splits").json()
+    assert segment(data, 1, 2)["duration_seconds"] == 30 * 60
+    assert segment(data, 2, 3)["duration_seconds"] == 30 * 60
+
+
+def test_batch_cross_runner_correction_reports_both_runners(client):
+    post(client, "BX-1", "TB3", 1, "2026-09-25T08:00:00")
+    post(client, "BX-2", "TB3", 2, "2026-09-25T08:40:00")
+    r = post_batch(client, [
+        batch_item("BY-1", "TB4", 1, "2026-09-25T08:05:00"),
+        batch_item("BY-2", "TB4", 2, "2026-09-25T08:40:00", corrects="BX-2"),
+    ])
+    assert r.status_code == 201
+    runners = {x["runner_id"] for x in r.json()["runners"]}
+    assert runners == {"TB3", "TB4"}  # 更正跨选手时含原选手与新选手
+
+
+def test_batch_forward_reference_fails_and_rolls_back(client):
+    r = post_batch(client, [
+        batch_item("BF-1", "TB5", 1, "2026-09-25T08:00:00"),
+        batch_item("BF-2", "TB5", 2, "2026-09-25T08:30:00", corrects="BF-3"),  # 前向引用
+        batch_item("BF-3", "TB5", 3, "2026-09-25T09:00:00"),
+    ])
+    assert r.status_code == 404
+    detail = r.json()["detail"]
+    assert detail["index"] == 1
+    assert detail["event_no"] == "BF-2"
+    assert "BF-3" in detail["reason"]
+    # 整体回滚：批内任何记录都未写入
+    assert client.get("/api/checkins/BF-1").status_code == 404
+    assert client.get("/api/checkins/BF-2").status_code == 404
+    assert client.get("/api/checkins/BF-3").status_code == 404
+    assert client.get("/api/runners/TB5/splits").status_code == 404
+
+
+def test_batch_duplicate_event_no_in_batch(client):
+    r = post_batch(client, [
+        batch_item("BD-1", "TB6", 1, "2026-09-25T08:00:00"),
+        batch_item("BD-1", "TB6", 2, "2026-09-25T08:30:00"),  # 批内重复事件号
+    ])
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["index"] == 1
+    assert detail["event_no"] == "BD-1"
+    assert "已存在" in detail["reason"]
+    assert client.get("/api/checkins/BD-1").status_code == 404
+
+
+def test_batch_conflicts_with_existing_event(client):
+    post(client, "BK-0", "TB7", 1, "2026-09-25T08:00:00")
+    r = post_batch(client, [
+        batch_item("BK-1", "TB7", 2, "2026-09-25T08:30:00"),
+        batch_item("BK-0", "TB7", 3, "2026-09-25T09:00:00"),  # 与库内已有事件号重复
+    ])
+    assert r.status_code == 409
+    assert r.json()["detail"]["index"] == 1
+    assert client.get("/api/checkins/BK-1").status_code == 404
+
+
+def test_batch_invalid_correction_rolls_back_status_changes(client):
+    post(client, "BE-1", "TB8", 1, "2026-09-25T08:00:00")
+    r = post_batch(client, [
+        batch_item("BE-2", "TB8", 1, "2026-09-25T08:01:00", corrects="BE-1"),  # 有效更正
+        batch_item("BE-3", "TB8", 1, "2026-09-25T08:02:00", corrects="BE-1"),  # 无效：BE-1 已被取代
+    ])
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["index"] == 1
+    assert detail["event_no"] == "BE-3"
+    # 状态变更一并回滚：BE-1 仍为 active，BE-2 / BE-3 未写入
+    assert client.get("/api/checkins/BE-1").json()["status"] == "active"
+    assert client.get("/api/checkins/BE-2").status_code == 404
+    assert client.get("/api/checkins/BE-3").status_code == 404
+
+
+def test_batch_station_out_of_range(client):
+    r = post_batch(client, [
+        batch_item("BS-1", "TB9", 1, "2026-09-25T08:00:00"),
+        batch_item("BS-2", "TB9", 7, "2026-09-25T08:30:00"),
+    ])
+    assert r.status_code == 422
+    assert r.json()["detail"]["index"] == 1
+    assert client.get("/api/checkins/BS-1").status_code == 404
+
+
+def test_batch_size_limits(client):
+    assert post_batch(client, []).status_code == 422
+    items = [batch_item(f"BL-{i}", "TB10", 1, "2026-09-25T08:00:00") for i in range(101)]
+    assert post_batch(client, items).status_code == 422
+    # 100 条为上限，可正常提交
+    items = [batch_item(f"BL-{i}", "TB10", 1, "2026-09-25T08:00:00") for i in range(100)]
+    r = post_batch(client, items)
+    assert r.status_code == 201
+    assert r.json()["count"] == 100

@@ -8,6 +8,9 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 
 from .models import (
+    BatchCheckinOut,
+    BatchCheckinRequest,
+    BatchRunnerResult,
     CheckinCreate,
     CheckinOut,
     CorrectionPreview,
@@ -143,6 +146,49 @@ def create_checkin(conn: sqlite3.Connection, payload: CheckinCreate) -> CheckinO
         corrects=payload.corrects,
         created_at=created,
     )
+
+
+def create_checkins_batch(
+    conn: sqlite3.Connection, payload: BatchCheckinRequest
+) -> BatchCheckinOut:
+    """批量登记打卡：整批在同一事务内处理，任一失败即整体回滚。
+
+    按提交顺序逐条校验并写入（与单条登记相同的校验与写入逻辑）；由于未提交
+    的写入对本连接可见，批内后续记录可用 corrects 更正本批前面刚写入且仍有效
+    的事件。任一记录校验失败（前向引用、批内或库内重复事件号、无效更正等）时，
+    抛出携带失败下标与原因的 HTTPException，本批所有新增记录与状态变更一并回滚。
+    """
+    event_nos: list[str] = []
+    runner_ids: list[str] = []
+
+    def _add_runner(rid: str) -> None:
+        if rid not in runner_ids:
+            runner_ids.append(rid)
+
+    with conn:  # 事务：整批同时成功或失败，异常时回滚所有写入与状态变更
+        for index, item in enumerate(payload.checkins):
+            try:
+                origin = _validate_payload(conn, item)
+            except HTTPException as exc:
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail={
+                        "index": index,
+                        "event_no": item.event_no,
+                        "reason": exc.detail,
+                    },
+                ) from exc
+            _insert_correction(conn, item, _to_utc(item.occurred_at), _now())
+            event_nos.append(item.event_no)
+            _add_runner(item.runner_id)
+            if origin is not None:
+                _add_runner(origin["runner_id"])  # 更正跨选手时含原选手
+
+    runners = [
+        BatchRunnerResult(runner_id=rid, **_summary(_compute_splits(conn, rid)).model_dump())
+        for rid in runner_ids
+    ]
+    return BatchCheckinOut(count=len(event_nos), event_nos=event_nos, runners=runners)
 
 
 def revoke_checkin(conn: sqlite3.Connection, event_no: str) -> CheckinOut:

@@ -25,6 +25,14 @@ class CorrectionPreview(CheckinCreate):
     )
 
 
+class BatchCheckinRequest(BaseModel):
+    """批量登记请求：1～100 条打卡，按数组顺序逐条处理。"""
+
+    checkins: list[CheckinCreate] = Field(
+        ..., min_length=1, max_length=100, description="按顺序处理的打卡列表（1～100 条）"
+    )
+
+
 class CheckinOut(BaseModel):
     event_no: str
     runner_id: str
@@ -66,6 +74,22 @@ class RunnerSummary(BaseModel):
     complete: bool = Field(..., description="所有分段均有效时为 true")
     total_seconds: Optional[int] = Field(default=None, description="总用时（秒），仅 complete 时给出")
     total: Optional[str] = Field(default=None, description="总用时，H:MM:SS")
+
+
+class BatchRunnerResult(RunnerSummary):
+    """批量提交成功后，某受影响选手的最终完成状态与总用时。"""
+
+    runner_id: str
+
+
+class BatchCheckinOut(BaseModel):
+    """批量登记成功响应：各条事件号 + 受影响选手的最终成绩摘要。"""
+
+    count: int = Field(..., description="本次写入的打卡条数")
+    event_nos: list[str] = Field(..., description="按提交顺序排列的各条事件号")
+    runners: list[BatchRunnerResult] = Field(
+        ..., description="受影响选手（含更正波及的原选手）按现有分段规则计算的最终结果"
+    )
 
 
 class SegmentChange(BaseModel):

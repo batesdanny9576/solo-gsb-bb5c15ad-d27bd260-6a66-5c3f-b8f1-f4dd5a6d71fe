@@ -8,7 +8,15 @@ from typing import Iterator, Optional
 from fastapi import Depends, FastAPI
 
 from . import db, seed, service
-from .models import CheckinCreate, CheckinOut, CorrectionPreview, PreviewCorrectionOut, SplitsOut
+from .models import (
+    BatchCheckinOut,
+    BatchCheckinRequest,
+    CheckinCreate,
+    CheckinOut,
+    CorrectionPreview,
+    PreviewCorrectionOut,
+    SplitsOut,
+)
 
 
 @asynccontextmanager
@@ -66,6 +74,18 @@ def post_checkin(
     payload: CheckinCreate, conn: sqlite3.Connection = Depends(get_db)
 ) -> CheckinOut:
     return service.create_checkin(conn, payload)
+
+
+@app.post(
+    "/api/checkins/batch",
+    response_model=BatchCheckinOut,
+    status_code=201,
+    summary="批量登记打卡（1～100 条，同事务，任一失败整体回滚）",
+)
+def post_checkins_batch(
+    payload: BatchCheckinRequest, conn: sqlite3.Connection = Depends(get_db)
+) -> BatchCheckinOut:
+    return service.create_checkins_batch(conn, payload)
 
 
 @app.post(

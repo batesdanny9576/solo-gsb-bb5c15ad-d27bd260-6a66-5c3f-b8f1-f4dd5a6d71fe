@@ -3,6 +3,7 @@
 基于 FastAPI + SQLite 的越野赛分段计时服务：
 
 - 接收带**唯一事件号**、选手号、站点序号、发生时间的打卡；
+- 支持**批量登记**：1～100 条打卡按顺序在同一事务内处理，任一失败即整体回滚；
 - 支持按事件号**更正**（新事件取代原事件）与**撤销**；
 - 支持**更正预演**：试算更正前后结果，整体回滚，不产生任何副作用；
 - 同一站点多条有效打卡取**最早时间**；
@@ -37,6 +38,7 @@ Compose 通过命名卷 `timing-data` 持久化数据；删除卷（`docker comp
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/checkins` | 登记打卡；携带 `corrects` 字段即为更正指定事件 |
+| `POST` | `/api/checkins/batch` | 批量登记 1～100 条打卡：同一事务处理，任一失败整体回滚 |
 | `POST` | `/api/checkins/preview-correction` | 预演更正：返回更正前后结果对照，整体回滚、无副作用 |
 | `POST` | `/api/checkins/{event_no}/revoke` | 按事件号撤销打卡 |
 | `GET` | `/api/checkins?runner_id=` | 打卡列表（含已更正 / 已撤销记录） |
@@ -102,6 +104,42 @@ curl -X POST http://localhost:8000/api/checkins/preview-correction \
 curl -X POST http://localhost:8000/api/checkins/E1002/revoke
 ```
 
+批量登记（1～100 条，按数组顺序逐条处理；每条字段与单条登记相同）：
+
+```bash
+curl -X POST http://localhost:8000/api/checkins/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "checkins": [
+      {"event_no":"E2001","runner_id":"R200","station_seq":1,"occurred_at":"2026-09-25T08:00:00"},
+      {"event_no":"E2002X","runner_id":"R200","station_seq":2,"occurred_at":"2026-09-25T12:00:00"},
+      {"event_no":"E2002","runner_id":"R200","station_seq":2,"occurred_at":"2026-09-25T08:32:00","corrects":"E2002X"},
+      {"event_no":"E2003","runner_id":"R200","station_seq":3,"occurred_at":"2026-09-25T09:12:00"}
+    ]
+  }'
+```
+
+批内后续记录可用 `corrects` 更正本批前面刚写入且仍有效的事件（上例中 `E2002` 更正同批的
+`E2002X`）。整批在同一数据库事务内处理：任一记录校验失败（前向引用、批内或库内重复事件号、
+无效更正、站点超范围等）时，本批所有新增记录与状态变更全部回滚，并返回失败下标与原因，例如：
+
+```json
+{"detail": {"index": 2, "event_no": "E2002", "reason": "被更正的事件 E2002X 不存在"}}
+```
+
+全部成功时返回 `201`，响应包含按提交顺序排列的各条事件号，以及受影响选手（更正跨选手时含
+原选手与新选手）按现有分段规则计算的最终完成状态和总用时：
+
+```json
+{
+  "count": 4,
+  "event_nos": ["E2001", "E2002X", "E2002", "E2003"],
+  "runners": [
+    {"runner_id": "R200", "complete": false, "total_seconds": null, "total": null}
+  ]
+}
+```
+
 查询分段结果：
 
 ```bash
@@ -137,4 +175,5 @@ pytest                               # 运行测试
 - 分段结果在查询时基于全部有效打卡实时重算，因此补传、更正、撤销立即反映到结果中；
 - 时间统一归一化为 UTC 存储，无时区的时间按 UTC 处理；
 - 更正与写入在同一事务中完成，事件号唯一性由数据库主键保证（重复返回 409）；
+- 批量登记按提交顺序逐条校验并写入，整批处于同一事务：任一失败即回滚全部新增记录与状态变更，并以 `{"detail": {"index", "event_no", "reason"}}` 返回失败下标与原因；成功后基于最新数据为受影响选手实时重算最终成绩；
 - 更正预演复用正式更正的校验与写入逻辑，在 `SAVEPOINT` 内试算后 `ROLLBACK TO` 整体回滚，对数据库零副作用。
